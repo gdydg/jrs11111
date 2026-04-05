@@ -152,7 +152,6 @@ def load_existing_entries_from_m3u():
 def _parse_match_datetime_from_channel_name(channel_name, current_year, tz):
     if not channel_name:
         return None
-    # 频道名通常以 "MM-DD HH:MM " 开头，如 "04-01 23:30 A VS B - 高清"
     match = re.match(r'^(\d{2}-\d{2} \d{2}:\d{2})', channel_name)
     if not match:
         return None
@@ -163,7 +162,6 @@ def _parse_match_datetime_from_channel_name(channel_name, current_year, tz):
     except ValueError:
         return None
 
-    # 处理跨年边界：如果解析结果比当前时间晚很多，说明是上一年
     if (match_dt - datetime.datetime.now(tz)).days > 180:
         try:
             match_dt = tz.localize(datetime.datetime.strptime(f"{current_year - 1}-{month_day_time}", "%Y-%m-%d %H:%M"))
@@ -180,7 +178,6 @@ def load_refreshed_channels():
         if isinstance(data, dict):
             return {k: v for k, v in data.items() if isinstance(k, str)}
         if isinstance(data, list):
-            # 兼容旧格式：["channel_a", "channel_b"]
             return {item: None for item in data if isinstance(item, str)}
     except Exception:
         pass
@@ -195,7 +192,6 @@ def save_refreshed_channels(refreshed_channels):
         pass
 
 def cleanup_refreshed_channels(refreshed_channels, now, tz, window_hours=5):
-    # 清理 JSON 中超出时间窗口的重抓记录，避免无限增长
     if not refreshed_channels:
         return {}
     current_year = now.year
@@ -209,7 +205,6 @@ def cleanup_refreshed_channels(refreshed_channels, now, tz, window_hours=5):
     return cleaned
 
 def keep_entries_within_time_window(existing_entries, now, tz, window_hours=5):
-    # 仅保留“当前时间前后 5 小时”的比赛源
     current_year = now.year
     window_seconds = window_hours * 3600
 
@@ -266,8 +261,16 @@ def generate_playlist():
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-            page = browser.new_page()
+            # ✅ 增加防内存泄漏关键参数
+            browser = p.chromium.launch(
+                headless=True, 
+                args=[
+                    '--no-sandbox', 
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu'
+                ]
+            )
             
             for match in matches:
                 try:
@@ -301,12 +304,16 @@ def generate_playlist():
                     
                     if not target_link: continue
 
+                    # ✅ 核心修复：为每场比赛开启独立的上下文和页面，阅后即焚，绝不复用
+                    context = browser.new_context()
+                    page = context.new_page()
+
                     try:
                         page.goto(target_link, wait_until="load", timeout=15000)
                         page.wait_for_timeout(2000)
                         detail_html = page.content()
                     except Exception:
-                        continue
+                        continue # 如果外层页报错，后续也会跳过，finally 仍会执行
 
                     detail_soup = BeautifulSoup(detail_html, 'html.parser')
                     target_lines = []
@@ -330,6 +337,7 @@ def generate_playlist():
                                 continue
                         
                         try:
+                            # 这里复用这一场比赛的专属 page 是可以的，因为一个比赛通常只有 2-3 个线路，不会无限堆积
                             page.goto(final_url, wait_until="load", timeout=15000)
                             page.wait_for_timeout(3000)
                             
@@ -350,9 +358,15 @@ def generate_playlist():
                                     success_count += 1
                         except Exception:
                             continue
-
+                            
                 except Exception:
                     continue
+                finally:
+                    # ✅ 核心修复：无论本场比赛抓取成功与否，强制清理页面和上下文
+                    if 'page' in locals() and not page.is_closed():
+                        page.close()
+                    if 'context' in locals():
+                        context.close()
             
             browser.close()
     except Exception as e:
@@ -382,7 +396,6 @@ def generate_playlist():
     tmp_m3u = OUTPUT_M3U_FILE + ".tmp"
     tmp_txt = OUTPUT_TXT_FILE + ".tmp"
 
-    # 1. 先把数据老老实实写到临时文件里
     with open(tmp_m3u, 'w', encoding='utf-8') as f:
         f.writelines(m3u_lines)
     with open(tmp_txt, 'w', encoding='utf-8') as f:
@@ -390,7 +403,6 @@ def generate_playlist():
             f.write(f"{group},#genre#\n")
             for ch in channels: f.write(f"{ch}\n")
             
-    # 2. 瞬间替换掉旧文件，确保播放器读取零卡顿、无空白期
     os.replace(tmp_m3u, OUTPUT_M3U_FILE)
     os.replace(tmp_txt, OUTPUT_TXT_FILE)
     save_refreshed_channels(refreshed_channels)
@@ -427,38 +439,51 @@ def debug_url():
     debug_info = {"target_url": target_url, "extracted_token": None, "decrypted_url": None, "frames_found": [], "resources_found": []}
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-            page = browser.new_page()
-            page.goto(target_url, wait_until="load", timeout=15000)
-            page.wait_for_timeout(3000) 
+            # ✅ Debug 路由同样增加参数和上下文管理
+            browser = p.chromium.launch(
+                headless=True, 
+                args=[
+                    '--no-sandbox', 
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu'
+                ]
+            )
+            context = browser.new_context()
+            page = context.new_page()
             
-            for f in page.frames:
-                debug_info["frames_found"].append(f.url)
-                if 'paps.html?id=' in f.url: debug_info["extracted_token"] = f.url.split('paps.html?id=')[-1]
-            
-            resource_urls = page.evaluate("() => performance.getEntriesByType('resource').map(r => r.name)")
-            debug_info["resources_found"] = resource_urls
-            
-            if not debug_info["extracted_token"]:
-                for url in resource_urls:
-                    if 'paps.html?id=' in url: debug_info["extracted_token"] = url.split('paps.html?id=')[-1]; break
-            
-            if debug_info["extracted_token"]: debug_info["decrypted_url"] = decrypt_id_to_url(debug_info["extracted_token"])
-            browser.close()
-    except Exception as e: debug_info["error"] = str(e)
+            try:
+                page.goto(target_url, wait_until="load", timeout=15000)
+                page.wait_for_timeout(3000) 
+                
+                for f in page.frames:
+                    debug_info["frames_found"].append(f.url)
+                    if 'paps.html?id=' in f.url: debug_info["extracted_token"] = f.url.split('paps.html?id=')[-1]
+                
+                resource_urls = page.evaluate("() => performance.getEntriesByType('resource').map(r => r.name)")
+                debug_info["resources_found"] = resource_urls
+                
+                if not debug_info["extracted_token"]:
+                    for url in resource_urls:
+                        if 'paps.html?id=' in url: debug_info["extracted_token"] = url.split('paps.html?id=')[-1]; break
+                
+                if debug_info["extracted_token"]: debug_info["decrypted_url"] = decrypt_id_to_url(debug_info["extracted_token"])
+            finally:
+                page.close()
+                context.close()
+                browser.close()
+                
+    except Exception as e: 
+        debug_info["error"] = str(e)
     return jsonify(debug_info)
 
 def run_scheduler():
-    # 每 8 分钟运行一次
     schedule.every(14).minutes.do(generate_playlist)
     while True:
         schedule.run_pending()
         time.sleep(30)
 
 if __name__ == "__main__":
-    # ==========================================
-    # 核心机制：启动时提前创建占位文件，杜绝 404
-    # ==========================================
     os.makedirs(os.path.dirname(OUTPUT_M3U_FILE), exist_ok=True)
     if not os.path.exists(OUTPUT_M3U_FILE):
         with open(OUTPUT_M3U_FILE, 'w', encoding='utf-8') as f:
@@ -474,7 +499,6 @@ if __name__ == "__main__":
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
     
-    # Sealos 默认部署端口按 5000 处理，同时兼容平台注入 PORT
     port = int(os.getenv("PORT", "5000"))
     print(f"Starting Flask server on 0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, threaded=True)
